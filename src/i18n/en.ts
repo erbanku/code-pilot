@@ -98,6 +98,8 @@ const en = {
   'settings.enableAutoApprove': 'Enable Auto-approve',
   'settings.generativeUITitle': 'Generative UI',
   'settings.generativeUIDesc': 'Enable interactive visualizations (charts, diagrams, mockups) in chat responses. Disabling saves tokens but removes visual generation capability.',
+  'settings.disableConflictCheckingTitle': 'Hide Conflict Warnings',
+  'settings.disableConflictCheckingDesc': 'Hide warnings about multiple Claude Code installations. Enable this if you intentionally run multiple versions side by side.',
   'settings.language': 'Language',
   'settings.languageDesc': 'Choose the display language for the interface',
   'settings.usage': 'Usage',
