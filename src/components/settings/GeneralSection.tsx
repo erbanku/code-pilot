@@ -128,6 +128,8 @@ export function GeneralSection() {
   const [skipPermSaving, setSkipPermSaving] = useState(false);
   const [generativeUI, setGenerativeUI] = useState(true);
   const [generativeUISaving, setGenerativeUISaving] = useState(false);
+  const [disableConflictChecking, setDisableConflictChecking] = useState(false);
+  const [conflictCheckSaving, setConflictCheckSaving] = useState(false);
   const { accountInfo } = useAccountInfo();
   const { t, locale, setLocale } = useTranslation();
 
@@ -140,6 +142,7 @@ export function GeneralSection() {
         setSkipPermissions(appSettings.dangerously_skip_permissions === "true");
         // generative_ui_enabled defaults to true when not set
         setGenerativeUI(appSettings.generative_ui_enabled !== "false");
+        setDisableConflictChecking(appSettings.disable_conflict_checking === "true");
       }
     } catch {
       // ignore
