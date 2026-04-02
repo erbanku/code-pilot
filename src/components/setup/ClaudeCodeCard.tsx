@@ -65,6 +65,16 @@ export function ClaudeCodeCard({ status, onStatusChange }: ClaudeCodeCardProps) 
   const [claudeStatus, setClaudeStatus] = useState<ClaudeStatus | null>(null);
   const [checking, setChecking] = useState(true);
   const [showCleanup, setShowCleanup] = useState(false);
+  const [disableConflictChecking, setDisableConflictChecking] = useState(false);
+
+  useEffect(() => {
+    fetch('/api/settings/app').then(async (res) => {
+      if (res.ok) {
+        const data = await res.json();
+        setDisableConflictChecking((data.settings?.disable_conflict_checking) === 'true');
+      }
+    }).catch(() => { /* ignore */ });
+  }, []);
 
   const checkStatus = useCallback(async () => {
     setChecking(true);
@@ -120,7 +130,7 @@ export function ClaudeCodeCard({ status, onStatusChange }: ClaudeCodeCardProps) 
           {claudeStatus.binaryPath && (
             <p className="text-[10px] font-mono text-muted-foreground/60">{claudeStatus.binaryPath}</p>
           )}
-          {(claudeStatus.otherInstalls?.length ?? 0) > 0 && (
+          {(claudeStatus.otherInstalls?.length ?? 0) > 0 && !disableConflictChecking && (
             <div className="mt-2 rounded bg-status-warning-muted p-2.5 text-xs space-y-2">
               <p className="font-medium text-status-warning-foreground">{t('setup.claude.conflict')}</p>
               <div className="text-muted-foreground">

@@ -202,6 +202,26 @@ export function GeneralSection() {
     }
   };
 
+  const handleDisableConflictCheckingToggle = async (checked: boolean) => {
+    setConflictCheckSaving(true);
+    try {
+      const res = await fetch("/api/settings/app", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          settings: { disable_conflict_checking: checked ? "true" : "" },
+        }),
+      });
+      if (res.ok) {
+        setDisableConflictChecking(checked);
+      }
+    } catch {
+      // ignore
+    } finally {
+      setConflictCheckSaving(false);
+    }
+  };
+
   return (
     <div className="max-w-3xl space-y-6">
       <UpdateCard />
@@ -236,6 +256,19 @@ export function GeneralSection() {
             checked={generativeUI}
             onCheckedChange={handleGenerativeUIToggle}
             disabled={generativeUISaving}
+          />
+        </FieldRow>
+
+        {/* Disable conflict checking toggle */}
+        <FieldRow
+          label={t('settings.disableConflictCheckingTitle')}
+          description={t('settings.disableConflictCheckingDesc')}
+          separator
+        >
+          <Switch
+            checked={disableConflictChecking}
+            onCheckedChange={handleDisableConflictCheckingToggle}
+            disabled={conflictCheckSaving}
           />
         </FieldRow>
 
