@@ -116,8 +116,18 @@ export function InstallWizard({
   const [logs, setLogs] = useState<string[]>([]);
   const [copied, setCopied] = useState(false);
   const [prereqs, setPrereqs] = useState<PrereqResult | null>(null);
+  const [disableConflictChecking, setDisableConflictChecking] = useState(false);
   const logEndRef = useRef<HTMLDivElement>(null);
   const cleanupRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    fetch("/api/settings/app").then(async (res) => {
+      if (res.ok) {
+        const data = await res.json();
+        setDisableConflictChecking((data.settings?.disable_conflict_checking) === "true");
+      }
+    }).catch(() => { /* ignore */ });
+  }, []);
 
   const scrollToBottom = useCallback(() => {
     logEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -267,7 +277,7 @@ export function InstallWizard({
   }, [open, checkPrereqs]);
 
   const steps = progress?.steps ?? [];
-  const hasConflicts = (prereqs?.otherInstalls?.length ?? 0) > 0;
+  const hasConflicts = (prereqs?.otherInstalls?.length ?? 0) > 0 && !disableConflictChecking;
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>

@@ -58,6 +58,16 @@ export function ConnectionStatus() {
   const [status, setStatus] = useState<ClaudeStatus | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [wizardOpen, setWizardOpen] = useState(false);
+  const [disableConflictChecking, setDisableConflictChecking] = useState(false);
+
+  useEffect(() => {
+    fetch("/api/settings/app").then(async (res) => {
+      if (res.ok) {
+        const data = await res.json();
+        setDisableConflictChecking((data.settings?.disable_conflict_checking) === "true");
+      }
+    }).catch(() => { /* ignore */ });
+  }, []);
 
   const isElectron =
     typeof window !== "undefined" &&
@@ -154,7 +164,7 @@ export function ConnectionStatus() {
   }, []);
 
   const connected = status?.connected ?? false;
-  const hasConflicts = (status?.otherInstalls?.length ?? 0) > 0;
+  const hasConflicts = (status?.otherInstalls?.length ?? 0) > 0 && !disableConflictChecking;
   const missingGit = status?.missingGit ?? false;
   const hasWarnings = hasConflicts || missingGit;
 
