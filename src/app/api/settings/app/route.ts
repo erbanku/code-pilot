@@ -16,6 +16,9 @@ const ALLOWED_KEYS = [
   'thinking_mode',
   'theme_mode',
   'theme_family',
+  'default_panel',
+  'agent_runtime',
+  'cli_enabled',
 ];
 
 export async function GET() {

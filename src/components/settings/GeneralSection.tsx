@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useSyncExternalStore } from "react";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import {
@@ -130,6 +130,7 @@ export function GeneralSection() {
   const [generativeUISaving, setGenerativeUISaving] = useState(false);
   const [disableConflictChecking, setDisableConflictChecking] = useState(false);
   const [conflictCheckSaving, setConflictCheckSaving] = useState(false);
+  const [defaultPanel, setDefaultPanel] = useState('file_tree');
   const { accountInfo } = useAccountInfo();
   const { t, locale, setLocale } = useTranslation();
 
@@ -143,6 +144,8 @@ export function GeneralSection() {
         // generative_ui_enabled defaults to true when not set
         setGenerativeUI(appSettings.generative_ui_enabled !== "false");
         setDisableConflictChecking(appSettings.disable_conflict_checking === "true");
+        // default_panel defaults to 'file_tree' when not set
+        setDefaultPanel(appSettings.default_panel || 'file_tree');
       }
     } catch {
       // ignore
@@ -179,6 +182,19 @@ export function GeneralSection() {
     } finally {
       setSkipPermSaving(false);
       setShowSkipPermWarning(false);
+    }
+  };
+
+  const handleDefaultPanelChange = async (value: string) => {
+    setDefaultPanel(value);
+    try {
+      await fetch("/api/settings/app", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ settings: { default_panel: value } }),
+      });
+    } catch {
+      // ignore
     }
   };
 
@@ -259,6 +275,25 @@ export function GeneralSection() {
           />
         </FieldRow>
 
+        {/* Default panel */}
+        <FieldRow
+          label={t('settings.defaultPanelTitle')}
+          description={t('settings.defaultPanelDesc')}
+          separator
+        >
+          <Select value={defaultPanel} onValueChange={handleDefaultPanelChange}>
+            <SelectTrigger className="w-[140px]">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="none">{t('settings.defaultPanelNone')}</SelectItem>
+              <SelectItem value="file_tree">{t('settings.defaultPanelFileTree')}</SelectItem>
+              <SelectItem value="dashboard">{t('settings.defaultPanelDashboard')}</SelectItem>
+              <SelectItem value="git">{t('settings.defaultPanelGit')}</SelectItem>
+            </SelectContent>
+          </Select>
+        </FieldRow>
+
         {/* Disable conflict checking toggle */}
         <FieldRow
           label={t('settings.disableConflictCheckingTitle')}
@@ -305,6 +340,9 @@ export function GeneralSection() {
             {t('setup.open')}
           </Button>
         </FieldRow>
+
+        {/* Error Reporting — right after Setup Center */}
+        <SentryToggle locale={locale} t={t} />
 
       </SettingsCard>
 
@@ -366,6 +404,46 @@ export function GeneralSection() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
     </div>
+  );
+}
+
+/* ── Sentry opt-out toggle (isolated state) ──────────────────── */
+
+const sentrySubscribe = (cb: () => void) => {
+  window.addEventListener('storage', cb);
+  return () => window.removeEventListener('storage', cb);
+};
+const getSentryEnabled = () => {
+  try { return localStorage.getItem('codepilot:sentry-disabled') !== 'true'; } catch { return true; }
+};
+const getSentryEnabledServer = () => true; // SSR default
+
+function SentryToggle({ locale, t }: { locale: string; t: (key: TranslationKey) => string }) {
+  const enabled = useSyncExternalStore(sentrySubscribe, getSentryEnabled, getSentryEnabledServer);
+
+  return (
+    <FieldRow
+      label={t('settings.errorReporting' as TranslationKey)}
+      description={t('settings.errorReportingDesc' as TranslationKey)}
+      separator
+    >
+      <Switch
+        checked={enabled}
+        onCheckedChange={(checked) => {
+          const disabled = !checked;
+          try {
+            localStorage.setItem('codepilot:sentry-disabled', disabled ? 'true' : 'false');
+            window.dispatchEvent(new StorageEvent('storage'));
+          } catch { /* ignore */ }
+          fetch('/api/settings/sentry', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ disabled }),
+          }).catch(() => { /* ignore */ });
+        }}
+      />
+    </FieldRow>
   );
 }

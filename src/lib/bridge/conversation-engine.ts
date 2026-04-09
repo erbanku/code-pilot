@@ -24,9 +24,10 @@ import {
   syncSdkTasks,
   getSession,
   getSetting,
+  getDefaultProviderId,
 } from '../db';
 import { resolveProvider as resolveProviderUnified } from '../provider-resolver';
-import { loadCodePilotMcpServers } from '../mcp-loader';
+import { loadCodePilotMcpServers, loadAllMcpServers } from '../mcp-loader';
 import { assembleContext } from '../context-assembler';
 import crypto from 'crypto';
 
@@ -153,9 +154,16 @@ export async function processMessage(
     }
     addMessage(sessionId, 'user', savedContent);
 
-    // Resolve provider via unified resolver (same logic as desktop chat route)
+    // Resolve provider via unified resolver.
+    // Priority chain:
+    // 1. Binding's provider_id (per-binding override)
+    // 2. Session's provider_id (if the DB column exists)
+    // 3. Global default provider (getDefaultProviderId)
+    // 4. 'env' mode fallback
+    const effectiveProviderId = binding.providerId || session?.provider_id || getDefaultProviderId() || undefined;
+
     const resolved = resolveProviderUnified({
-      sessionProviderId: session?.provider_id || undefined,
+      providerId: effectiveProviderId,
       model: binding.model || undefined,
       sessionModel: session?.model || undefined,
     });
@@ -163,6 +171,19 @@ export async function processMessage(
 
     // Use upstream model from unified resolver (same chain as chat route)
     const effectiveModel = resolved.upstreamModel || resolved.model || binding.model || session?.model || getSetting('default_model') || undefined;
+
+    // Guard: protocol/model mismatch — e.g. google protocol with model 'sonnet'
+    // would silently send a wrong request. Fail fast with a clear error.
+    if (resolvedProvider && resolved.protocol) {
+      const modelLower = (effectiveModel || '').toLowerCase();
+      const isAnthropicModel = modelLower.includes('claude') || ['sonnet', 'opus', 'haiku'].includes(modelLower);
+      const isNonAnthropicProtocol = !['anthropic', 'openai-compatible', 'openrouter'].includes(resolved.protocol);
+      if (isAnthropicModel && isNonAnthropicProtocol) {
+        const errMsg = `Provider "${resolvedProvider.name}" uses ${resolved.protocol} protocol but model "${effectiveModel}" is an Anthropic model. Please configure the correct provider for this bridge channel.`;
+        console.error(`[conversation-engine] ${errMsg}`);
+        throw new Error(errMsg);
+      }
+    }
 
     // Permission mode from binding mode
     let permissionMode: string;
@@ -191,9 +212,12 @@ export async function processMessage(
       }
     }
 
-    // Load only MCP servers needing CodePilot-specific processing (${...} env placeholders).
-    // All other MCP servers are auto-loaded by the SDK via settingSources.
-    const mcpServers = loadCodePilotMcpServers();
+    // Load MCP servers using shared runtime prediction (same logic as chat route)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { predictNativeRuntime } = require('../runtime') as typeof import('../runtime');
+    const mcpServers = predictNativeRuntime(effectiveProviderId)
+      ? loadAllMcpServers()
+      : loadCodePilotMcpServers();
 
     // Unified context assembly — adds CLI tools context (and workspace prompt if applicable)
     const assembled = await assembleContext({
@@ -230,6 +254,7 @@ export async function processMessage(
       abortController,
       permissionMode,
       provider: resolvedProvider,
+      providerId: effectiveProviderId,
       sessionProviderId: session?.provider_id || undefined,
       mcpServers,
       conversationHistory: historyMsgs,
@@ -297,6 +322,18 @@ async function consumeStream(
         }
 
         switch (event.type) {
+          case 'thinking': {
+            // Accumulate thinking deltas into a thinking content block
+            const delta = event.data;
+            const lastBlock = contentBlocks[contentBlocks.length - 1];
+            if (lastBlock && lastBlock.type === 'thinking' && 'thinking' in lastBlock) {
+              (lastBlock as { type: 'thinking'; thinking: string }).thinking += delta;
+            } else {
+              contentBlocks.push({ type: 'thinking', thinking: delta });
+            }
+            break;
+          }
+
           case 'text':
             currentText += event.data;
             if (onPartialText) {
@@ -432,10 +469,10 @@ async function consumeStream(
 
     // Save assistant message
     if (contentBlocks.length > 0) {
-      const hasToolBlocks = contentBlocks.some(
-        (b) => b.type === 'tool_use' || b.type === 'tool_result'
+      const hasStructuredBlocks = contentBlocks.some(
+        (b) => b.type === 'tool_use' || b.type === 'tool_result' || b.type === 'thinking'
       );
-      const content = hasToolBlocks
+      const content = hasStructuredBlocks
         ? JSON.stringify(contentBlocks)
         : contentBlocks
             .filter((b): b is Extract<MessageContentBlock, { type: 'text' }> => b.type === 'text')
@@ -448,12 +485,19 @@ async function consumeStream(
       }
     }
 
-    // Extract text-only response for IM delivery
-    const responseText = contentBlocks
+    // Extract response for IM delivery — include text blocks, and if none exist
+    // but thinking blocks are present, include a summary so thinking-only turns
+    // are not silently dropped.
+    const textParts = contentBlocks
       .filter((b): b is Extract<MessageContentBlock, { type: 'text' }> => b.type === 'text')
-      .map((b) => b.text)
-      .join('')
-      .trim();
+      .map((b) => b.text);
+    if (textParts.length === 0) {
+      const thinkingBlocks = contentBlocks.filter((b) => b.type === 'thinking' && 'thinking' in b);
+      if (thinkingBlocks.length > 0) {
+        textParts.push('_(reasoning completed, no text output)_');
+      }
+    }
+    const responseText = textParts.join('').trim();
 
     return {
       responseText,
@@ -469,10 +513,10 @@ async function consumeStream(
       contentBlocks.push({ type: 'text', text: currentText });
     }
     if (contentBlocks.length > 0) {
-      const hasToolBlocks = contentBlocks.some(
-        (b) => b.type === 'tool_use' || b.type === 'tool_result'
+      const hasStructuredBlocks = contentBlocks.some(
+        (b) => b.type === 'tool_use' || b.type === 'tool_result' || b.type === 'thinking'
       );
-      const content = hasToolBlocks
+      const content = hasStructuredBlocks
         ? JSON.stringify(contentBlocks)
         : contentBlocks
             .filter((b): b is Extract<MessageContentBlock, { type: 'text' }> => b.type === 'text')
@@ -487,8 +531,16 @@ async function consumeStream(
     const isAbort = e instanceof DOMException && e.name === 'AbortError'
       || e instanceof Error && e.name === 'AbortError';
 
+    // Build error responseText — include indicator if thinking blocks were present
+    const errorTextParts = contentBlocks
+      .filter((b): b is Extract<MessageContentBlock, { type: 'text' }> => b.type === 'text')
+      .map((b) => b.text);
+    if (errorTextParts.length === 0 && contentBlocks.some((b) => b.type === 'thinking')) {
+      errorTextParts.push('_(reasoning completed, no text output)_');
+    }
+
     return {
-      responseText: '',
+      responseText: errorTextParts.join('').trim(),
       tokenUsage,
       hasError: true,
       errorMessage: isAbort ? 'Task stopped by user' : (e instanceof Error ? e.message : 'Stream consumption error'),

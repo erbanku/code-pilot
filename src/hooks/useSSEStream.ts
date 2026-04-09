@@ -10,6 +10,7 @@ interface ToolUseInfo {
 interface ToolResultInfo {
   tool_use_id: string;
   content: string;
+  is_error?: boolean;
   media?: MediaBlock[];
 }
 
@@ -26,6 +27,7 @@ export interface SSECallbacks {
   onModeChanged: (mode: string) => void;
   onTaskUpdate: (sessionId: string) => void;
   onRewindPoint: (sdkUserMessageId: string) => void;
+  onThinking?: (delta: string) => void;
   onKeepAlive: () => void;
   onError: (accumulated: string) => void;
   onInitMeta?: (meta: {
@@ -54,6 +56,11 @@ function handleSSEEvent(
       return next;
     }
 
+    case 'thinking': {
+      callbacks.onThinking?.(event.data);
+      return accumulated;
+    }
+
     case 'tool_use': {
       try {
         const toolData = JSON.parse(event.data);
@@ -74,6 +81,7 @@ function handleSSEEvent(
         callbacks.onToolResult({
           tool_use_id: resultData.tool_use_id,
           content: resultData.content,
+          ...(resultData.is_error ? { is_error: true } : {}),
           ...(Array.isArray(resultData.media) && resultData.media.length > 0
             ? { media: resultData.media }
             : {}),
@@ -203,15 +211,22 @@ function handleSSEEvent(
           if (parsed.details) {
             errorDisplay += `\n\nDetails: ${parsed.details}`;
           }
-          // Add diagnostic guidance for provider/auth related errors
-          const diagCategories = new Set([
-            'AUTH_REJECTED', 'AUTH_FORBIDDEN', 'AUTH_STYLE_MISMATCH',
-            'NO_CREDENTIALS', 'PROVIDER_NOT_APPLIED', 'MODEL_NOT_AVAILABLE',
-            'NETWORK_UNREACHABLE', 'ENDPOINT_NOT_FOUND', 'PROCESS_CRASH',
-            'CLI_NOT_FOUND', 'UNSUPPORTED_FEATURE',
-          ]);
-          if (diagCategories.has(parsed.category)) {
-            errorDisplay += '\n\n💡 [Run Provider Diagnostics](/settings#providers) to troubleshoot, or check the [Provider Setup Guide](https://www.codepilot.sh/docs/providers).';
+          // Render recovery actions as markdown links
+          if (parsed.recoveryActions && parsed.recoveryActions.length > 0) {
+            const links: string[] = [];
+            for (const a of parsed.recoveryActions as Array<{ label: string; url?: string; action?: string }>) {
+              if (a.url) {
+                links.push(`[${a.label}](${a.url})`);
+              } else if (a.action === 'open_settings') {
+                links.push(`[${a.label}](/settings#providers)`);
+              } else if (a.action === 'new_conversation') {
+                links.push(`[${a.label}](/chat)`);
+              }
+              // 'retry' is handled by the retryable flag, not as a link
+            }
+            if (links.length > 0) {
+              errorDisplay += '\n\n' + links.join(' · ');
+            }
           }
         } else {
           errorDisplay = event.data;
@@ -306,6 +321,7 @@ export function useSSEStream() {
         onModeChanged: (m) => callbacksRef.current?.onModeChanged(m),
         onTaskUpdate: (s) => callbacksRef.current?.onTaskUpdate(s),
         onRewindPoint: (id) => callbacksRef.current?.onRewindPoint(id),
+        onThinking: (d) => callbacksRef.current?.onThinking?.(d),
         onKeepAlive: () => callbacksRef.current?.onKeepAlive(),
         onError: (a) => callbacksRef.current?.onError(a),
         onInitMeta: (m) => callbacksRef.current?.onInitMeta?.(m),

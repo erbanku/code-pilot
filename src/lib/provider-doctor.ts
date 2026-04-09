@@ -28,6 +28,7 @@ import {
   type Protocol,
 } from '@/lib/provider-catalog';
 import { classifyError, type ClassifiedError } from '@/lib/error-classifier';
+import { getOAuthStatus } from '@/lib/openai-oauth-manager';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import type { Options, SDKResultSuccess } from '@anthropic-ai/claude-agent-sdk';
 import os from 'os';
@@ -213,15 +214,36 @@ async function runAuthProbe(): Promise<ProbeResult> {
     });
   }
 
+  // Check OpenAI OAuth status
+  let openaiOAuthOk = false;
+  try {
+    const oauthStatus = getOAuthStatus();
+    if (oauthStatus.authenticated) {
+      openaiOAuthOk = true;
+      findings.push({
+        severity: oauthStatus.needsRefresh ? 'warn' : 'ok',
+        code: 'auth.openai-oauth',
+        message: `OpenAI OAuth authenticated${oauthStatus.email ? ` (${oauthStatus.email})` : ''}${oauthStatus.plan ? ` — ${oauthStatus.plan}` : ''}`,
+        ...(oauthStatus.needsRefresh ? { detail: 'Token is near expiry and will be refreshed on next use' } : {}),
+      });
+    }
+  } catch { /* OpenAI OAuth not available */ }
+
   if (!envApiKey && !envAuthToken && !dbAuthToken) {
     // Check if there are any configured providers with keys
     const providers = getAllProviders();
     const withKeys = providers.filter(p => !!p.api_key);
-    if (withKeys.length === 0) {
+    if (withKeys.length === 0 && !openaiOAuthOk) {
       findings.push({
         severity: 'error',
         code: 'auth.no-credentials',
-        message: 'No API credentials found (environment, DB settings, or providers)',
+        message: 'No API credentials found (environment, DB settings, providers, or OpenAI OAuth)',
+      });
+    } else if (withKeys.length === 0 && openaiOAuthOk) {
+      findings.push({
+        severity: 'ok',
+        code: 'auth.openai-oauth-only',
+        message: 'No Anthropic credentials, but OpenAI OAuth is available',
       });
     } else {
       findings.push({
@@ -942,16 +964,13 @@ function attachRepairsToFindings(probes: ProbeResult[]): void {
             const targetPid = defaultProviderId || firstProvider?.id;
             if (!targetPid) continue;
             params.providerId = targetPid;
-            // Detect current auth style from the provider's extra_env and suggest the opposite
+            // Detect current auth style from preset catalog (not extra_env)
             const targetProvider = getProvider(targetPid);
             if (targetProvider) {
-              try {
-                const env = JSON.parse(targetProvider.extra_env || '{}');
-                const currentlyUsingToken = 'ANTHROPIC_AUTH_TOKEN' in env;
-                params.authStyle = currentlyUsingToken ? 'api-key' : 'auth-token';
-              } catch {
-                params.authStyle = 'auth-token'; // safe default
-              }
+              const protocol = (targetProvider.protocol || inferProtocolFromLegacy(targetProvider.provider_type, targetProvider.base_url)) as Protocol;
+              const preset = findPresetForLegacy(targetProvider.base_url, targetProvider.provider_type, protocol);
+              const currentlyUsingToken = preset?.authStyle === 'auth_token';
+              params.authStyle = currentlyUsingToken ? 'api-key' : 'auth-token';
             }
             break;
           }

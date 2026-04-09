@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback, useEffect, useRef } from 'react';
+import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import { useRouter } from 'next/navigation';
 import type { Message, MessagesResponse, FileAttachment, SessionStreamSnapshot } from '@/types';
 import { MessageList } from './MessageList';
@@ -9,6 +9,7 @@ import { ChatComposerActionBar } from './ChatComposerActionBar';
 import { ModeIndicator } from './ModeIndicator';
 import { ChatPermissionSelector } from './ChatPermissionSelector';
 import { ContextUsageIndicator } from './ContextUsageIndicator';
+import { RuntimeBadge } from './RuntimeBadge';
 import { ImageGenToggle } from './ImageGenToggle';
 import { Button } from '@/components/ui/button';
 import { usePanel } from '@/hooks/usePanel';
@@ -35,9 +36,13 @@ interface ChatViewProps {
   providerId?: string;
   initialPermissionProfile?: 'default' | 'full_access';
   initialMode?: 'code' | 'plan';
+  initialHasSummary?: boolean;
 }
 
-export function ChatView({ sessionId, initialMessages = [], initialHasMore = false, modelName, providerId, initialPermissionProfile, initialMode }: ChatViewProps) {
+/** Maximum messages kept in React state. Older messages are trimmed and reloaded on scroll. */
+const MAX_MESSAGES_IN_MEMORY = 300;
+
+export function ChatView({ sessionId, initialMessages = [], initialHasMore = false, modelName, providerId, initialPermissionProfile, initialMode, initialHasSummary }: ChatViewProps) {
   const { setStreamingSessionId, workingDirectory, setPendingApprovalSessionId, setDashboardPanelOpen, setFileTreeOpen, setIsAssistantWorkspace } = usePanel();
   const { t } = useTranslation();
   const router = useRouter();
@@ -53,12 +58,59 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
   const [hasMore, setHasMore] = useState(initialHasMore);
   const [loadingMore, setLoadingMore] = useState(false);
   const loadingMoreRef = useRef(false);
+
+  /** Tracks whether the tail (newest messages) was trimmed during a prepend. */
+  const tailTrimmedRef = useRef(false);
+
+  /**
+   * Capped message setter for append paths (user send, stream completion, commands).
+   *
+   * - Normal case: trims head (oldest) when exceeding cap, sets hasMore = true.
+   * - If tail was previously trimmed by a prepend (user scrolled far up): re-fetches
+   *   the latest messages from DB as a fresh base, then applies the append on top.
+   *   This slides the window back to the bottom without losing the new message.
+   */
+  /**
+   * Reconcile the message window with DB after tail was trimmed.
+   * Preserves local-only cmd-* messages (/help, /cost) since they're never persisted.
+   * Called with a delay to ensure pending persists have completed.
+   */
+  const reconcileWithDb = useCallback(() => {
+    fetch(`/api/chat/sessions/${sessionId}/messages?limit=50`)
+      .then(res => res.ok ? res.json() : null)
+      .then(data => {
+        if (!data?.messages) return;
+        setHasMore(data.hasMore ?? true);
+        const dbMessages: Message[] = data.messages;
+        setMessages(current => {
+          const localCommands = current.filter(m => m.id.startsWith('cmd-'));
+          if (localCommands.length === 0) return dbMessages;
+          const merged = [...dbMessages, ...localCommands];
+          return merged.length > MAX_MESSAGES_IN_MEMORY
+            ? merged.slice(-MAX_MESSAGES_IN_MEMORY)
+            : merged;
+        });
+      })
+      .catch(() => { /* keep current state as-is */ });
+  }, [sessionId]);
+
+  const cappedSetMessages: typeof setMessages = useCallback((action) => {
+    setMessages((prev) => {
+      const next = typeof action === 'function' ? action(prev) : action;
+      if (next.length > MAX_MESSAGES_IN_MEMORY) {
+        setHasMore(true);
+        return next.slice(-MAX_MESSAGES_IN_MEMORY);
+      }
+      return next;
+    });
+  }, []);
   const [mode, setMode] = useState<string>(initialMode || 'code');
   const [currentModel, setCurrentModel] = useState(() => modelName || (typeof window !== 'undefined' ? localStorage.getItem('codepilot:last-model') : null) || 'sonnet');
   const [currentProviderId, setCurrentProviderId] = useState(() => providerId || (typeof window !== 'undefined' ? localStorage.getItem('codepilot:last-provider-id') : null) || '');
   const [selectedEffort, setSelectedEffort] = useState<string | undefined>(undefined);
   const [thinkingMode, setThinkingMode] = useState<string>('adaptive');
   const [context1m, setContext1m] = useState(false);
+  const [hasSummary, setHasSummary] = useState(initialHasSummary || false);
 
   // Sync model/provider when session data loads
   useEffect(() => { if (modelName) setCurrentModel(modelName); }, [modelName]);
@@ -95,6 +147,7 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
   const toolUses = streamSnapshot?.toolUses ?? [];
   const toolResults = streamSnapshot?.toolResults ?? [];
   const streamingToolOutput = streamSnapshot?.streamingToolOutput ?? '';
+  const streamingThinkingContent = streamSnapshot?.streamingThinkingContent ?? '';
   const statusText = streamSnapshot?.statusText;
   const pendingPermission = streamSnapshot?.pendingPermission ?? null;
   const permissionResolved = streamSnapshot?.permissionResolved ?? null;
@@ -136,12 +189,23 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
 
   // ── Extracted hooks ──
 
+  const handleStreamCompleted = useCallback((phase: string) => {
+    // Only reconcile on normal completion — both messages are persisted.
+    // Error/stopped/idle-timeout paths emit 'completed' before the server
+    // has persisted partial output, so reconciliation would race.
+    if (tailTrimmedRef.current && phase === 'completed') {
+      tailTrimmedRef.current = false;
+      reconcileWithDb();
+    }
+  }, [reconcileWithDb]);
+
   useStreamSubscription({
     sessionId,
     setStreamSnapshot,
     setStreamingSessionId,
     setPendingApprovalSessionId,
-    setMessages,
+    setMessages: cappedSetMessages,
+    onStreamCompleted: handleStreamCompleted,
   });
 
   const initializedRef = useRef(false);
@@ -153,6 +217,26 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
   }, [initialMessages]);
 
   useEffect(() => { setHasMore(initialHasMore); }, [initialHasMore]);
+
+  // Detect compression from multiple sources:
+  // 1. Auto-compression: stream-session-manager dispatches 'context-compressed' event
+  // 2. Manual /compact: response message contains the compression marker
+  useEffect(() => {
+    if (!hasSummary && messages.some(m => m.role === 'assistant' && m.content.includes('上下文已压缩'))) {
+      setHasSummary(true);
+    }
+  }, [messages, hasSummary]);
+
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      if (detail?.sessionId === sessionId) {
+        setHasSummary(true);
+      }
+    };
+    window.addEventListener('context-compressed', handler);
+    return () => window.removeEventListener('context-compressed', handler);
+  }, [sessionId]);
 
   const buildThinkingConfig = useCallback((): { type: string } | undefined => {
     if (!thinkingMode || thinkingMode === 'adaptive') return { type: 'adaptive' };
@@ -202,12 +286,9 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
           const isAssistant = !!data.path;
           setIsAssistantProject(isAssistant);
           setWorkspaceMismatchPath(null);
-          // Assistant project: show dashboard (with assistant status card) instead of file tree
           setIsAssistantWorkspace(isAssistant);
-          if (isAssistant) {
-            setFileTreeOpen(false);
-            setDashboardPanelOpen(true);
-          }
+          // Default panel is now controlled by the user's "Default Side Panel" setting
+          // in chat/[id]/page.tsx — no longer force-override for assistant workspaces.
           // Load assistant name for avatar display
           if (data.path) {
             try {
@@ -275,7 +356,16 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
       const data: MessagesResponse = await res.json();
       setHasMore(data.hasMore ?? false);
       if (data.messages.length > 0) {
-        setMessages(prev => [...data.messages, ...prev]);
+        setMessages(prev => {
+          const merged = [...data.messages, ...prev];
+          if (merged.length > MAX_MESSAGES_IN_MEMORY) {
+            // Trim newest messages off the tail — they'll be restored when
+            // the next append triggers cappedSetMessages (re-fetches from DB).
+            tailTrimmedRef.current = true;
+            return merged.slice(0, MAX_MESSAGES_IN_MEMORY);
+          }
+          return merged;
+        });
       }
     } finally {
       loadingMoreRef.current = false;
@@ -312,7 +402,7 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
         created_at: new Date().toISOString(),
         token_usage: null,
       };
-      setMessages((prev) => [...prev, userMessage]);
+      cappedSetMessages((prev) => [...prev, userMessage]);
 
       const notices = pendingImageNoticesRef.current.length > 0
         ? [...pendingImageNoticesRef.current]
@@ -344,6 +434,10 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
           console.log('[ChatView] SDK init meta received:', meta);
         },
       });
+
+      // If the message window is stale (tailTrimmedRef), reconciliation will
+      // happen on stream completion via onStreamCompleted — at that point both
+      // user and assistant messages are persisted, so no race is possible.
     },
     [sessionId, isStreaming, mode, currentModel, currentProviderId, selectedEffort, context1m, buildThinkingConfig, handleModeChange]
   );
@@ -417,7 +511,7 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
     return () => window.removeEventListener('dashboard-command', handler);
   }, []);
 
-  const handleCommand = useChatCommands({ sessionId, messages, setMessages, sendMessage });
+  const handleCommand = useChatCommands({ sessionId, messages, setMessages: cappedSetMessages, sendMessage });
 
   // Listen for image generation completion
   useEffect(() => {
@@ -470,6 +564,7 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
         toolUses={toolUses}
         toolResults={toolResults}
         streamingToolOutput={streamingToolOutput}
+        streamingThinkingContent={streamingThinkingContent}
         statusText={statusText}
         onForceStop={stopStreaming}
         hasMore={hasMore}
@@ -522,10 +617,15 @@ export function ChatView({ sessionId, initialMessages = [], initialHasMore = fal
           />
         }
         right={
-          <ContextUsageIndicator
-            messages={messages}
-            modelName={currentModel}
-          />
+          <div className="flex items-center gap-1">
+            <RuntimeBadge providerId={currentProviderId} />
+            <ContextUsageIndicator
+              messages={messages}
+              modelName={currentModel}
+              context1m={context1m}
+              hasSummary={hasSummary}
+            />
+          </div>
         }
       />
     </div>

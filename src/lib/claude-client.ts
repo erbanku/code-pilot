@@ -18,6 +18,8 @@ import { isImageFile } from '@/types';
 import { registerPendingPermission } from './permission-registry';
 import { registerConversation, unregisterConversation } from './conversation-registry';
 import { captureCapabilities, isCacheFresh, setCachedPlugins } from './agent-sdk-capabilities';
+import { normalizeMessageContent, microCompactMessage } from './message-normalizer';
+import { roughTokenEstimate } from './context-estimator';
 import { getSetting, updateSdkSessionId, createPermissionRequest } from './db';
 import { resolveForClaudeCode, toClaudeCodeEnv } from './provider-resolver';
 import { findClaudeBinary, findGitBash, getExpandedPath, invalidateClaudePathCache } from './platform';
@@ -236,38 +238,71 @@ function getUploadedFilePaths(files: FileAttachment[], workDir: string): string[
   return paths;
 }
 
-/**
- * Build a context-enriched prompt by prepending conversation history.
- * Used when SDK session resume is unavailable or fails.
- */
-function buildPromptWithHistory(
-  prompt: string,
-  history?: Array<{ role: 'user' | 'assistant'; content: string }>,
-): string {
-  if (!history || history.length === 0) return prompt;
+// Message normalization is in message-normalizer.ts (shared with context-compressor.ts).
+// Imported dynamically in buildFallbackContext to avoid circular deps at module level.
 
-  const lines: string[] = [
-    '<conversation_history>',
-    '(This is a summary of earlier conversation turns for context. Tool calls shown here were already executed — do not repeat them or output their markers as text.)',
-  ];
-  for (const msg of history) {
-    // For assistant messages with tool blocks (JSON arrays), extract only the text portions.
-    // Tool-use and tool-result blocks are omitted to avoid Claude parroting them as plain text.
-    let content = msg.content;
-    if (msg.role === 'assistant' && content.startsWith('[')) {
-      try {
-        const blocks = JSON.parse(content);
-        const parts: string[] = [];
-        for (const b of blocks) {
-          if (b.type === 'text' && b.text) parts.push(b.text);
-          // Skip tool_use and tool_result — they were already executed
-        }
-        content = parts.length > 0 ? parts.join('\n') : '(assistant used tools)';
-      } catch {
-        // Not JSON, use as-is
-      }
+/**
+ * Build fallback context from conversation history with token-budget awareness.
+ *
+ * Instead of a fixed message count, walks backward from the newest message
+ * and includes as many as fit within the token budget. Optionally prepends
+ * a session summary as a context skeleton for the full conversation.
+ */
+function buildFallbackContext(params: {
+  prompt: string;
+  history?: Array<{ role: 'user' | 'assistant'; content: string }>;
+  sessionSummary?: string;
+  tokenBudget?: number;
+}): string {
+  const { prompt, history, sessionSummary, tokenBudget } = params;
+  if (!history || history.length === 0) {
+    if (sessionSummary) {
+      return `<session-summary>\n${sessionSummary}\n</session-summary>\n\n${prompt}`;
     }
-    lines.push(`${msg.role === 'user' ? 'Human' : 'Assistant'}: ${content}`);
+    return prompt;
+  }
+
+  // Normalize + microcompact: strip metadata, summarize tool blocks, truncate old messages
+  const normalized = history.map((msg, i) => ({
+    role: msg.role,
+    content: microCompactMessage(
+      msg.role,
+      normalizeMessageContent(msg.role, msg.content),
+      history.length - 1 - i, // ageFromEnd: 0 = newest
+    ),
+  }));
+
+  // Select messages within token budget (walk backward from newest).
+  // Floor at 10K tokens so even extreme sessions keep some recent context.
+  const effectiveBudget = tokenBudget != null ? Math.max(tokenBudget, 10000) : undefined;
+  let selected: typeof normalized;
+  if (effectiveBudget) {
+    selected = [];
+    let accumulated = 0;
+    for (let i = normalized.length - 1; i >= 0; i--) {
+      const msgTokens = roughTokenEstimate(normalized[i].content) + 10; // role label overhead
+      if (accumulated + msgTokens > effectiveBudget) break;
+      selected.unshift(normalized[i]);
+      accumulated += msgTokens;
+    }
+  } else {
+    selected = normalized;
+  }
+
+  // Build the output
+  const lines: string[] = [];
+
+  if (sessionSummary) {
+    lines.push('<session-summary>');
+    lines.push(sessionSummary);
+    lines.push('</session-summary>');
+    lines.push('');
+  }
+
+  lines.push('<conversation_history>');
+  lines.push('(This is a summary of earlier conversation turns for context. Tool calls shown here were already executed — do not repeat them or output their markers as text.)');
+  for (const msg of selected) {
+    lines.push(`${msg.role === 'user' ? 'Human' : 'Assistant'}: ${msg.content}`);
   }
   lines.push('</conversation_history>');
   lines.push('');
@@ -370,7 +405,97 @@ export async function generateTextViaSdk(params: {
   return resultText;
 }
 
+/**
+ * Main entry point for streaming chat. Dispatches to the resolved AgentRuntime.
+ *
+ * All callers (chat route, bridge, onboarding) call this function.
+ * It converts ClaudeStreamOptions → RuntimeStreamOptions, resolves
+ * the appropriate runtime, and delegates.
+ */
 export function streamClaude(options: ClaudeStreamOptions): ReadableStream<string> {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { resolveRuntime, getRuntime } = require('./runtime') as typeof import('./runtime');
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { detectTransport, isNativeCompatible } = require('./provider-transport') as typeof import('./provider-transport');
+
+  // ── Capability-aware routing ────────────────────────────────
+  // Route to the right runtime based on provider + user setting.
+  const cliDisabled = getSetting('cli_enabled') === 'false';
+  const effectiveProvider = options.providerId || options.sessionProviderId || '';
+  let runtime;
+
+  // Non-Anthropic providers (OpenAI OAuth, etc.) MUST use Native Runtime
+  // because Claude Code SDK only supports Anthropic models.
+  const isNonAnthropicProvider = effectiveProvider === 'openai-oauth';
+
+  if (isNonAnthropicProvider) {
+    runtime = getRuntime('native');
+  } else if (!cliDisabled) {
+    // Only attempt transport-based SDK forcing when CLI is enabled
+    try {
+      const { transport } = detectTransport({
+        providerId: options.providerId,
+        sessionProviderId: options.sessionProviderId,
+      });
+
+      if (!isNativeCompatible(transport)) {
+        const sdkRt = getRuntime('claude-code-sdk');
+        if (sdkRt?.isAvailable()) {
+          runtime = sdkRt;
+        }
+      }
+    } catch { /* ignore detection errors — fall through to normal routing */ }
+  }
+
+  if (!runtime) {
+    runtime = resolveRuntime(getSetting('agent_runtime') || undefined);
+  }
+
+  console.log(`[streamClaude] Using runtime: ${runtime.id} (setting: ${getSetting('agent_runtime') || 'auto'})`);
+
+  return runtime.stream({
+    // Universal fields
+    prompt: options.prompt,
+    sessionId: options.sessionId,
+    model: options.model,
+    systemPrompt: options.systemPrompt,
+    workingDirectory: options.workingDirectory,
+    abortController: options.abortController,
+    autoTrigger: options.autoTrigger,
+    providerId: options.providerId,
+    sessionProviderId: options.sessionProviderId,
+    thinking: options.thinking,
+    effort: options.effort,
+    context1m: options.context1m,
+    mcpServers: options.mcpServers,
+    permissionMode: options.permissionMode,
+    bypassPermissions: options.bypassPermissions,
+    onRuntimeStatusChange: options.onRuntimeStatusChange,
+
+    // Runtime-specific fields (SDK Runtime reads these from runtimeOptions)
+    runtimeOptions: {
+      sdkSessionId: options.sdkSessionId,
+      files: options.files,
+      conversationHistory: options.conversationHistory,
+      sessionSummary: options.sessionSummary,
+      fallbackTokenBudget: options.fallbackTokenBudget,
+      imageAgentMode: options.imageAgentMode,
+      toolTimeoutSeconds: options.toolTimeoutSeconds,
+      outputFormat: options.outputFormat,
+      agents: options.agents,
+      agent: options.agent,
+      enableFileCheckpointing: options.enableFileCheckpointing,
+      generativeUI: options.generativeUI,
+      provider: options.provider,
+    },
+  });
+}
+
+/**
+ * SDK path — used by SdkRuntime. Contains the original Claude Code SDK query() logic.
+ * Exported so sdk-runtime.ts can call it without circular dependency issues.
+ */
+export function streamClaudeSdk(options: ClaudeStreamOptions): ReadableStream<string> {
   const {
     prompt,
     sessionId,
@@ -400,6 +525,9 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
 
   return new ReadableStream<string>({
     async start(controller) {
+      // Flag to prevent infinite PTL retry loops (at most one retry per request)
+      let ptlRetryAttempted = false;
+
       // Resolve provider via the unified resolver. The caller may pass an explicit
       // provider (from resolveProvider().provider), or undefined when 'env' mode is
       // intended. We do NOT fall back to getActiveProvider() here — that's handled
@@ -790,7 +918,8 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
           // Restore runtime status after permission resolved
           onRuntimeStatusChange?.('running');
 
-          return result;
+          // Cast to SDK PermissionResult (NativePermissionResult is a compatible subset)
+          return result as unknown as import('@anthropic-ai/claude-agent-sdk').PermissionResult;
         };
 
         // Telegram notification context for hooks
@@ -835,7 +964,12 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
         // When NOT resuming (fresh or fallback), prepend DB history for context.
         function buildFinalPrompt(useHistory: boolean): string | AsyncIterable<SDKUserMessage> {
           const basePrompt = useHistory
-            ? buildPromptWithHistory(prompt, conversationHistory)
+            ? buildFallbackContext({
+                prompt,
+                history: conversationHistory,
+                sessionSummary: options.sessionSummary,
+                tokenBudget: options.fallbackTokenBudget,
+              })
             : prompt;
 
           if (!files || files.length === 0) return basePrompt;
@@ -854,18 +988,26 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
           }
 
           if (imageFiles.length > 0) {
+            // Limit media items: keep the MOST RECENT images (drop oldest first),
+            // consistent with "preserve recent context" strategy.
+            const MAX_MEDIA_ITEMS = 100;
+            const limitedImages = imageFiles.length > MAX_MEDIA_ITEMS
+              ? imageFiles.slice(-MAX_MEDIA_ITEMS)
+              : imageFiles;
+            const droppedCount = imageFiles.length - limitedImages.length;
+
             // In imageAgentMode, skip file path references so Claude doesn't
             // try to use built-in tools to analyze images from disk. It will
             // see the images via vision (base64 content blocks) and follow the
             // IMAGE_AGENT_SYSTEM_PROMPT to output image-gen-request blocks.
-            // In normal mode, append disk paths so skills can reference them.
+            // In normal mode, append disk paths — only for the images actually included.
             const textWithImageRefs = imageAgentMode
               ? textPrompt
               : (() => {
                   const workDir = resolvedWorkingDirectory.path;
-                  const imagePaths = getUploadedFilePaths(imageFiles, workDir);
+                  const imagePaths = getUploadedFilePaths(limitedImages, workDir);
                   const imageReferences = imagePaths
-                    .map((p, i) => `[User attached image: ${p} (${imageFiles[i].name})]`)
+                    .map((p, i) => `[User attached image: ${p} (${limitedImages[i].name})]`)
                     .join('\n');
                   return `${imageReferences}\n\n${textPrompt}`;
                 })();
@@ -875,17 +1017,30 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
               | { type: 'text'; text: string }
             > = [];
 
-            for (const img of imageFiles) {
+            for (const img of limitedImages) {
+              // Read base64 from disk if the data was cleared after upload
+              let imgData = img.data;
+              if (!imgData && img.filePath) {
+                try {
+                  imgData = fs.readFileSync(img.filePath).toString('base64');
+                } catch {
+                  continue; // Skip images whose files are missing
+                }
+              }
+              if (!imgData) continue;
               contentBlocks.push({
                 type: 'image',
                 source: {
                   type: 'base64',
                   media_type: (img.type || 'image/png') as 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp',
-                  data: img.data,
+                  data: imgData,
                 },
               });
             }
 
+            if (droppedCount > 0) {
+              contentBlocks.push({ type: 'text', text: `[Note: ${droppedCount} older image(s) were omitted due to the ${MAX_MEDIA_ITEMS}-image limit per request.]` });
+            }
             contentBlocks.push({ type: 'text', text: textWithImageRefs });
 
             const userMessage: SDKUserMessage = {
@@ -1130,6 +1285,9 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
                 if ('text' in delta && delta.text) {
                   controller.enqueue(formatSSE({ type: 'text', data: delta.text }));
                 }
+                if ('thinking' in delta && (delta as { thinking?: string }).thinking) {
+                  controller.enqueue(formatSSE({ type: 'thinking', data: (delta as { thinking: string }).thinking }));
+                }
               }
               break;
             }
@@ -1274,6 +1432,11 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
           code: error instanceof Error ? (error as NodeJS.ErrnoException).code : undefined,
         });
 
+        // Look up preset meta for recovery action URLs
+        const presetForMeta = resolved.provider?.base_url
+          ? (await import('./provider-catalog')).findPresetForLegacy(resolved.provider.base_url, resolved.provider.provider_type, resolved.protocol)
+          : undefined;
+
         // Classify the error using structured pattern matching
         const classified = classifyError({
           error,
@@ -1284,7 +1447,174 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
           thinkingEnabled: !!thinking,
           context1mEnabled: !!context1m,
           effortSet: !!effort,
+          providerMeta: presetForMeta?.meta ? {
+            apiKeyUrl: presetForMeta.meta.apiKeyUrl,
+            docsUrl: presetForMeta.meta.docsUrl,
+            pricingUrl: presetForMeta.meta.pricingUrl,
+          } : undefined,
         });
+
+        // ── Reactive compact: auto-compress and retry on CONTEXT_TOO_LONG ──
+        if (classified.category === 'CONTEXT_TOO_LONG' && !ptlRetryAttempted && conversationHistory && conversationHistory.length > 4) {
+          ptlRetryAttempted = true;
+          try {
+            console.log('[claude-client] CONTEXT_TOO_LONG detected — attempting auto-compress + retry');
+            controller.enqueue(formatSSE({ type: 'status', data: JSON.stringify({ notification: true, message: 'context_compressing_retry' }) }));
+
+            const { compressConversation } = await import('./context-compressor');
+            const { updateSessionSummary: updateSummary } = await import('@/lib/db');
+            const compResult = await compressConversation({
+              sessionId,
+              messages: conversationHistory,
+              existingSummary: options.sessionSummary,
+              providerId: options.providerId || options.sessionProviderId,
+              sessionModel: model,
+            });
+            updateSummary(sessionId, compResult.summary);
+            options.sessionSummary = compResult.summary;
+            // Recalculate fallback budget with new summary size
+            const newSummaryTokens = roughTokenEstimate(compResult.summary);
+            const promptTokens = roughTokenEstimate(prompt);
+            const systemTokens = roughTokenEstimate(systemPrompt || '');
+            // Use a conservative 50% of actual context window for retry
+            const { getContextWindow } = await import('./model-context');
+            const ctxWindow = getContextWindow(model || 'sonnet', { context1m: !!context1m }) || 200000;
+            const retryBudget = Math.max(10000, Math.floor(ctxWindow * 0.5 - systemTokens - newSummaryTokens - promptTokens));
+            console.log(`[claude-client] Compressed ${compResult.messagesCompressed} messages for PTL retry, budget=${retryBudget}`);
+
+            // Clear stale session so retry starts fresh
+            if (sessionId) {
+              try { updateSdkSessionId(sessionId, ''); } catch { /* best effort */ }
+            }
+
+            // Build retry prompt using compressed context with recalculated budget
+            const retryPrompt = buildFallbackContext({
+              prompt,
+              history: conversationHistory,
+              sessionSummary: options.sessionSummary,
+              tokenBudget: retryBudget,
+            });
+
+            // Rebuild minimal query options from closure variables
+            // (queryOptions is scoped to the try block and not accessible here)
+            const retryOptions: Options = {
+              cwd: options.workingDirectory || os.homedir(),
+              abortController,
+              permissionMode: 'bypassPermissions' as Options['permissionMode'],
+              allowDangerouslySkipPermissions: true,
+              env: { ...process.env as Record<string, string> },
+              maxTurns: undefined,
+            };
+            if (model) retryOptions.model = model;
+            if (systemPrompt) {
+              retryOptions.systemPrompt = { type: 'preset', preset: 'claude_code', append: systemPrompt };
+            }
+
+            const retryConversation = query({ prompt: retryPrompt, options: retryOptions });
+
+            // Forward retry stream events (simplified — covers the critical path)
+            for await (const msg of retryConversation) {
+              if (abortController?.signal.aborted) break;
+              switch (msg.type) {
+                case 'assistant': {
+                  const aMsg = msg as SDKAssistantMessage;
+                  for (const block of aMsg.message.content) {
+                    if (block.type === 'tool_use') {
+                      controller.enqueue(formatSSE({ type: 'tool_use', data: JSON.stringify({ id: block.id, name: block.name, input: block.input }) }));
+                    }
+                  }
+                  break;
+                }
+                case 'user': {
+                  const uMsg = msg as { type: 'user'; message: { content: Array<{ type: string; content?: string | Array<Record<string, unknown>>; tool_use_id?: string; is_error?: boolean }> } };
+                  for (const block of uMsg.message.content) {
+                    if (block.type === 'tool_result') {
+                      const retryMedia: MediaBlock[] = [];
+                      let retryContent = '';
+
+                      if (Array.isArray(block.content)) {
+                        // Array-form tool result (external MCP): extract text + image/audio blocks
+                        const textParts: string[] = [];
+                        for (const c of block.content) {
+                          const cb = c as { type: string; text?: string; data?: string; mimeType?: string; media_type?: string };
+                          if (cb.type === 'text' && cb.text) {
+                            textParts.push(cb.text);
+                          } else if ((cb.type === 'image' || cb.type === 'audio') && cb.data) {
+                            retryMedia.push({
+                              type: cb.type === 'audio' ? 'audio' : 'image',
+                              data: cb.data,
+                              mimeType: cb.mimeType || cb.media_type || (cb.type === 'image' ? 'image/png' : 'audio/wav'),
+                            });
+                          }
+                        }
+                        retryContent = textParts.join('\n').slice(0, 2000);
+                      } else if (typeof block.content === 'string') {
+                        retryContent = block.content.slice(0, 2000);
+                      }
+
+                      // Extract __MEDIA_RESULT__ markers from text content
+                      const RETRY_MEDIA_MARKER = '__MEDIA_RESULT__';
+                      const retryMarkerIdx = retryContent.indexOf(RETRY_MEDIA_MARKER);
+                      if (retryMarkerIdx >= 0) {
+                        try {
+                          const mediaJson = retryContent.slice(retryMarkerIdx + RETRY_MEDIA_MARKER.length).trim();
+                          const parsed = JSON.parse(mediaJson) as Array<{ type: string; mimeType: string; localPath: string; mediaId?: string }>;
+                          for (const m of parsed) {
+                            retryMedia.push({
+                              type: (m.type as MediaBlock['type']) || 'image',
+                              mimeType: m.mimeType,
+                              localPath: m.localPath,
+                              mediaId: m.mediaId,
+                            });
+                          }
+                        } catch { /* malformed marker */ }
+                        retryContent = retryContent.slice(0, retryMarkerIdx).trim();
+                      }
+
+                      controller.enqueue(formatSSE({ type: 'tool_result', data: JSON.stringify({
+                        tool_use_id: block.tool_use_id,
+                        content: retryContent,
+                        ...(block.is_error ? { is_error: true } : {}),
+                        ...(retryMedia.length > 0 ? { media: retryMedia } : {}),
+                      }) }));
+                    }
+                  }
+                  break;
+                }
+                case 'stream_event': {
+                  const se = msg as { type: 'stream_event'; event: { type: string; delta?: { text?: string; thinking?: string }; index?: number } };
+                  if (se.event.type === 'content_block_delta') {
+                    if (se.event.delta?.text) {
+                      controller.enqueue(formatSSE({ type: 'text', data: se.event.delta.text }));
+                    }
+                    if (se.event.delta?.thinking) {
+                      controller.enqueue(formatSSE({ type: 'thinking', data: se.event.delta.thinking }));
+                    }
+                  }
+                  break;
+                }
+                case 'result': {
+                  const rMsg = msg as SDKResultMessage;
+                  if ('result' in rMsg) {
+                    const usage = extractTokenUsage(rMsg as SDKResultSuccess);
+                    if (usage) {
+                      controller.enqueue(formatSSE({ type: 'result', data: JSON.stringify(usage) }));
+                    }
+                  }
+                  // Emit compression notification so frontend updates hasSummary
+                  controller.enqueue(formatSSE({ type: 'status', data: JSON.stringify({ notification: true, message: 'context_compressed' }) }));
+                  break;
+                }
+              }
+            }
+            controller.enqueue(formatSSE({ type: 'done', data: '' }));
+            controller.close();
+            return; // Retry succeeded — skip normal error path
+          } catch (retryErr) {
+            console.warn('[claude-client] PTL retry failed, falling through to error display:', retryErr);
+            // Fall through to normal error handling below
+          }
+        }
 
         // Send structured error JSON so frontend can parse category + hints
         // Falls back gracefully for older frontends that only read raw text
@@ -1299,6 +1629,7 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
             providerName: classified.providerName,
             details: classified.details,
             rawMessage: classified.rawMessage,
+            recoveryActions: classified.recoveryActions,
             // Include formatted text for backward compatibility
             _formattedMessage: errorMessage,
           }),
@@ -1328,4 +1659,142 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
       abortController?.abort();
     },
   });
+}
+
+// ── Provider Connection Test ─────────────────────────────────────
+
+export interface ConnectionTestResult {
+  success: boolean;
+  error?: {
+    code: string;
+    message: string;
+    suggestion: string;
+    recoveryActions?: Array<{ label: string; url?: string; action?: string }>;
+  };
+}
+
+/**
+ * Test a provider connection by sending a direct HTTP request to the API endpoint.
+ * Bypasses the Claude Code SDK subprocess entirely to avoid false positives
+ * from keychain/OAuth credentials leaking into the test.
+ */
+export async function testProviderConnection(config: {
+  apiKey: string;
+  baseUrl: string;
+  protocol: string;
+  authStyle: string;
+  envOverrides?: Record<string, string>;
+  modelName?: string;
+  presetKey?: string;
+  providerName?: string;
+  providerMeta?: { apiKeyUrl?: string; docsUrl?: string; pricingUrl?: string };
+}): Promise<ConnectionTestResult> {
+  const { getPreset, findPresetForLegacy } = await import('./provider-catalog');
+
+  // Look up preset for default model
+  const preset = config.presetKey
+    ? getPreset(config.presetKey)
+    : (config.baseUrl ? findPresetForLegacy(config.baseUrl, 'custom', config.protocol as import('./provider-catalog').Protocol) : undefined);
+
+  // Determine model to use in test request
+  const model = config.modelName
+    || preset?.defaultRoleModels?.default
+    || (preset?.defaultModels?.[0]?.upstreamModelId || preset?.defaultModels?.[0]?.modelId)
+    || 'sonnet';
+
+  // For bedrock/vertex/env_only protocols, we can't do a simple HTTP test
+  if (config.protocol === 'bedrock' || config.protocol === 'vertex' || config.authStyle === 'env_only') {
+    return {
+      success: false,
+      error: { code: 'SKIPPED', message: 'Cloud providers (Bedrock/Vertex) require IAM or OAuth credentials — connection test is not available for this provider type', suggestion: 'Save the configuration and send a message to verify' },
+    };
+  }
+
+  // Build the API URL — Anthropic-compatible endpoint
+  let apiUrl = config.baseUrl || 'https://api.anthropic.com';
+  // Ensure URL ends with /v1/messages for Anthropic-compatible providers
+  if (!apiUrl.endsWith('/v1/messages')) {
+    apiUrl = apiUrl.replace(/\/+$/, '');
+    if (!apiUrl.endsWith('/v1')) {
+      apiUrl += '/v1';
+    }
+    apiUrl += '/messages';
+  }
+
+  // Build headers based on auth style
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'anthropic-version': '2023-06-01',
+  };
+  if (config.authStyle === 'auth_token') {
+    headers['Authorization'] = `Bearer ${config.apiKey}`;
+  } else {
+    headers['x-api-key'] = config.apiKey;
+  }
+
+  // Minimal request body — just enough to verify auth + endpoint
+  const body = JSON.stringify({
+    model,
+    max_tokens: 1,
+    messages: [{ role: 'user', content: 'ping' }],
+  });
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 15_000);
+
+  try {
+    const response = await fetch(apiUrl, {
+      method: 'POST',
+      headers,
+      body,
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+
+    // 2xx = success (even if model returns an error in body, auth works)
+    if (response.ok) {
+      return { success: true };
+    }
+
+    // Parse error response
+    let errorBody = '';
+    try { errorBody = await response.text(); } catch { /* ignore */ }
+
+    const classified = classifyError({
+      error: new Error(`HTTP ${response.status}: ${errorBody.slice(0, 500)}`),
+      providerName: config.providerName,
+      baseUrl: config.baseUrl,
+      providerMeta: config.providerMeta,
+    });
+
+    return {
+      success: false,
+      error: {
+        code: classified.category,
+        message: classified.userMessage,
+        suggestion: classified.actionHint,
+        recoveryActions: classified.recoveryActions,
+      },
+    };
+  } catch (err) {
+    clearTimeout(timeoutId);
+
+    // Network errors (ECONNREFUSED, ENOTFOUND, timeout, etc.)
+    const classified = classifyError({
+      error: err,
+      providerName: config.providerName,
+      baseUrl: config.baseUrl,
+      providerMeta: config.providerMeta,
+    });
+
+    return {
+      success: false,
+      error: {
+        code: classified.category,
+        message: classified.userMessage,
+        suggestion: classified.actionHint,
+        recoveryActions: classified.recoveryActions,
+      },
+    };
+  }
 }

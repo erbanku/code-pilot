@@ -1,6 +1,6 @@
 {
   "name": "codepilot",
-  "version": "0.44.1",
+  "version": "0.48.0",
   "private": true,
   "license": "BUSL-1.1",
   "workspaces": [
@@ -9,9 +9,10 @@
   ],
   "author": {
     "name": "op7418",
-    "email": "7418@openclaw.ai"
+    "email": "guohao631@gmail.com",
+    "url": "https://x.com/op7418"
   },
-  "description": "A native desktop GUI client for Claude Code",
+  "description": "A multi-model AI agent desktop client",
   "main": "dist-electron/main.js",
   "scripts": {
     "dev": "next dev",
@@ -48,6 +49,9 @@
     "@google/genai": "^1.43.0",
     "@larksuiteoapi/node-sdk": "^1.59.0",
     "@lobehub/icons": "^4.6.0",
+    "@sentry/browser": "^9.27.0",
+    "@sentry/electron": "^6.3.0",
+    "@sentry/node": "^9.27.0",
     "@phosphor-icons/react": "^2.1.10",
     "@radix-ui/react-use-controllable-state": "^1.2.2",
     "@streamdown/cjk": "^1.0.1",
